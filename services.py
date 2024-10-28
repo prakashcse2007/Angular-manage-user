@@ -1,54 +1,75 @@
 from db import get_db_connection
 from schemas import ClaimRequest, ClaimResponse, ClaimLineItemResponse
+from exceptions import ClaimProcessingException
 
-def calculate_commission_and_code(
-    differential_amount: float, 
-    billable_amount: float, 
-    flat_rate: float = None, 
-    threshold: float = 150.0
-) -> tuple[float, str]:
+def get_rate_sheets(conn, line_items):
     """
-    Calculate the payment amount with flat rate and determine process codes.
+    Fetch rate sheet details for all line items in a single query.
     """
-    ten_percent_billable = 0.10 * billable_amount
+    placeholders = ', '.join(['%s'] * len(line_items))
+    query = f"""
+        SELECT rendering_npi, service_code, billing_provider_tin, postal_code,
+               rate_sheet_id, rbrvs_percentage, flat_rate, rbrvs_amount
+        FROM rate_sheets
+        WHERE (rendering_npi, service_code, billing_provider_tin, postal_code) 
+              IN ({placeholders})
+    """
 
-    # Calculate payment amount considering flat rate
-    if flat_rate is not None and flat_rate < threshold:
-        payment_amount = min(flat_rate, ten_percent_billable)
-    else:
-        payment_amount = min(threshold, ten_percent_billable)
+    params = [(item.rendering_npi, item.service_code, item.tin, item.postal_code)
+              for item in line_items]
+    
+    with conn.cursor() as cur:
+        cur.execute(query, [val for tup in params for val in tup])
+        rows = cur.fetchall()
+        
+    if not rows:
+        raise ClaimProcessingException("No rate sheets found for the provided line items.")
 
-    # Determine process codes
-    process_codes = []
-    if differential_amount < threshold:
-        process_codes.append("TFDA")
-    if ten_percent_billable < 150:
-        process_codes.append("TPBA")
-
-    process_code = ",".join(process_codes)
-    return payment_amount, process_code
+    # Create a lookup dictionary for quick access by keys (NPI, service code, etc.)
+    return {(row['rendering_npi'], row['service_code'], 
+             row['billing_provider_tin'], row['postal_code']): row for row in rows}
 
 def process_claim(claim_data: ClaimRequest) -> ClaimResponse:
     conn = get_db_connection()
     try:
+        # Fetch all rate sheets in a single query
+        rate_sheets = get_rate_sheets(conn, claim_data.line_items)
+
         total_billed = total_diff = total_commission = 0.0
         processed_line_items = []
 
         for line in claim_data.line_items:
-            result = process_claim_line_item(conn, line)
-
-            commission, code = calculate_commission_and_code(
-                differential_amount=result.differential_amount,
-                billable_amount=result.billed_amount,
-                flat_rate=result.flat_rate
+            rate_data = rate_sheets.get(
+                (line.rendering_npi, line.service_code, line.tin, line.postal_code)
             )
 
-            total_billed += result.billed_amount
-            total_diff += result.differential_amount
+            if not rate_data:
+                raise ClaimProcessingException(
+                    f"Rate sheet not found for item {line.item_id}."
+                )
+
+            billed_amount = (
+                rate_data['flat_rate'] if rate_data['flat_rate'] 
+                else (rate_data['rbrvs_percentage'] / 100) * rate_data['rbrvs_amount']
+            )
+            differential_amount = billed_amount - line.provider_allowed_amount
+
+            # Calculate commission and process codes
+            commission, code = calculate_commission_and_code(
+                differential_amount=differential_amount,
+                billable_amount=billed_amount,
+                flat_rate=rate_data['flat_rate']
+            )
+
+            total_billed += billed_amount
+            total_diff += differential_amount
             total_commission += commission
 
             processed_line_items.append({
-                **result.dict(),
+                **line.dict(),
+                "rate_sheet_id": rate_data['rate_sheet_id'],
+                "billed_amount": billed_amount,
+                "differential_amount": differential_amount,
                 "commission_amount": commission,
                 "process_code": code
             })
@@ -62,38 +83,3 @@ def process_claim(claim_data: ClaimRequest) -> ClaimResponse:
         )
     finally:
         conn.close()
-
-def process_claim_line_item(conn, line_item):
-    # Simulate a database call to fetch rate sheet data
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT rate_sheet_id, rbrvs_percentage, flat_rate, rbrvs_amount
-            FROM rate_sheets
-            WHERE rendering_npi = %s AND service_code = %s 
-              AND billing_provider_tin = %s AND postal_code = %s
-            """,
-            (line_item.rendering_npi, line_item.service_code, 
-             line_item.tin, line_item.postal_code)
-        )
-        row = cur.fetchone()
-
-    if row:
-        rate_sheet_id, percentage, flat_rate, rbrvs_amount = row
-        billed_amount = flat_rate if flat_rate else (percentage / 100) * rbrvs_amount
-        differential_amount = billed_amount - line_item.provider_allowed_amount
-
-        return ClaimLineItemResponse(
-            item_id=line_item.item_id,
-            rendering_npi=line_item.rendering_npi,
-            service_code=line_item.service_code,
-            tin=line_item.tin,
-            postal_code=line_item.postal_code,
-            provider_allowed_amount=line_item.provider_allowed_amount,
-            rate_sheet_id=rate_sheet_id,
-            billed_amount=billed_amount,
-            differential_amount=differential_amount,
-            flat_rate=flat_rate
-        )
-    else:
-        raise ValueError("Rate sheet not found for the given parameters.")
