@@ -1,0 +1,35 @@
+from pydantic import BaseModel
+from typing import List, Optional
+
+class ClaimLineItemRequest(BaseModel):
+    item_id: str
+    rendering_npi: str
+    service_code: str
+    tin: str
+    postal_code: str
+    provider_allowed_amount: float
+
+class ClaimRequest(BaseModel):
+    claim_id: str
+    line_items: List[ClaimLineItemRequest]
+
+class ClaimLineItemResponse(BaseModel):
+    item_id: str
+    rendering_npi: str
+    service_code: str
+    tin: str
+    postal_code: str
+    provider_allowed_amount: float
+    rate_sheet_id: int
+    billed_amount: float
+    differential_amount: float
+    flat_rate: Optional[float] = None
+    commission_amount: float
+    process_code: str
+
+class ClaimResponse(BaseModel):
+    claim_id: str
+    total_billed_amount: float
+    total_differential_amount: float
+    total_commission_amount: float
+    line_items: List[ClaimLineItemResponse]
